@@ -35,7 +35,7 @@ is the common want; the flag is there for the rare case you do want them.
 
 ## 2026-10-20 — Stop recursing into files (page.aspx treated as a directory)
 
-**Problem.** On an IIS/ASP.NET target (`insurance.example.com`) shortloop was
+**Problem.** On an IIS/ASP.NET target (`sub.example.com`) shortloop was
 running shortscan against `forgotpassword.aspx/`, `logoff.aspx/`,
 `navigation.aspx/`, `transfer.aspx/` — i.e. recursing into *pages* as if they
 were directories. Two things combined: (1) for a name shortscan already resolved,
@@ -182,7 +182,7 @@ recall for both branch (1) prefix+suffix and `--compound-stems`. Cost is linear:
 
 ## 2026-10-19 — `--compound-stems`: suffix the dictionary matches, not just the prefix
 
-**Problem.** On `wrapup.example.com`, `CONTRA~1` and `EXPORT~1` (dirs) and
+**Problem.** On `sub.example.com`, `CONTRA~1` and `EXPORT~1` (dirs) and
 `CONTRA~1.ZIP` stayed unresolved even though the curated pass already tests the
 bare dictionary words `contract(s)`, `contractor(s)`, `export(s)` — i.e. the
 real names are *compounds* (`contractmanagement`, `exportdata`, `contract_...`),
@@ -212,7 +212,7 @@ default because of the multiplier; turn it on for a stubborn truncated stem.
 ## 2026-10-19 — Add .well-known validation dirs to the custom list
 
 **Problem.** The custom pass (below) didn't cover `PKI-VA~1`, which on the
-certs.example.com run was `.well-known/pki-validation/` — the standard ACME/SSL
+sub.example.com run was `.well-known/pki-validation/` — the standard ACME/SSL
 domain-validation directory. It's extension-less, so it fell through to the
 loud retry (76k requests) for a name that's effectively a constant.
 
@@ -233,7 +233,7 @@ left-behind validation tokens).
 
 ## 2026-10-19 — Custom full-name pass before the loud last-chance retry
 
-**Problem.** On a real run (`certs.example.com`) two short names stayed
+**Problem.** On a real run (`sub.example.com`) two short names stayed
 unresolved and went straight to the loud retry: `WEB~1.CON` (really
 `web.config`) and `DEFAUL~1.CS` (really a `Default.*.cs` code-behind). The
 candidate generator can never build these — `candidate_stems` only emits
@@ -260,7 +260,7 @@ candidate generator can never build these — `candidate_stems` only emits
 **Why.** These specific names are both high-value (config files, source
 code-behind) and unreachable by the fan-out, so a handful of targeted requests
 lands them for pennies and removes them from the expensive loud retry — in the
-certs.example.com run, the root's two leftovers become 15 candidates instead of
+sub.example.com run, the root's two leftovers become 15 candidates instead of
 38,779, and only the genuinely unknown `PKI-VA~1` still needs loud.
 
 ---

@@ -33,13 +33,47 @@ shortscan ──► candidate generation (raft wordlists + numbers) ──► ff
      `.PHP` → `.php`, `.HTM` → `.html`, `.ASP` → `.aspx`, `.CON` → `.config`/`.conf`,
      `.ASA` → `.asax`, etc.); any prefix *not* in that table fans out to every
      extension starting with those 3 chars. Shorter means the extension is known
-     exactly. No extension → it's probed as both a directory and an ext-less file.
+     exactly. No extension → the bare `name` is probed (a directory reveals
+     itself by 301-redirecting to `name/`; `--probe-dirs` also fires `name/`).
    - If shortscan already resolved a `fullname`, it's seeded straight in.
-3. **ffuf** fires the candidate set at the live server. `-ac` auto-calibration
-   drops wildcard noise; the response tells us file vs directory
-   (a directory 301-redirects to `.../name/`, or a `name/` probe returns 200/403).
+3. **ffuf** fires the candidate set at the live server, in **two tiers** (see
+   [Tiered fan-out](#tiered-fan-out)). `-ac` auto-calibration drops wildcard
+   noise; the response tells us file vs directory (a directory 301-redirects to
+   `.../name/`).
 4. Every confirmed **directory** becomes the next shortscan target. Repeat to
    `--max-depth`.
+
+### Tiered fan-out
+
+The candidate set for a truncated short name is dominated by the suffix
+compounds and numeric completions (hundreds of candidates), but most real
+word-names are recovered by the cheap **dictionary prefix-match**. So shortloop
+fires in two tiers per directory and only pays for the expensive part when it
+has to:
+
+- **Tier 1** (cheap, high-hit): the shortscan `fullname` if any, the bare 6-char
+  prefix, the dictionary prefix-matches, and any **run-global confirmed
+  vocabulary** (names confirmed elsewhere this run whose 8.3 collides here — the
+  same app reuses its vocabulary across directories, so these are retried first
+  on recursion). Usually a handful to a few dozen candidates.
+- **Tier 2** (the fan-out): the prefix+suffix compounds, `--compound-stems`, and
+  numeric completions — fired **only at the short names tier 1 didn't resolve**,
+  and deduped against what tier 1 already sent.
+
+A name that resolves to a plain dictionary word (`streaming`, `orderdetails`)
+never pays for tier 2 at all — e.g. `STREAM~1` drops from ~1,300 candidates to
+~9. The end-of-run summary prints the **total candidate requests fired** so you
+can see the effect.
+
+Two defaults further trim tier 2's volume (both reversible):
+
+- An extension-less short name fires only the **bare** `name` probe, not
+  `name/`; a real directory reveals itself by 301-redirecting `name` → `name/`,
+  so the slash probe is redundant and doubles the count. `--probe-dirs` restores
+  it for a server where `name` 404s but `name/` answers.
+- `--number-matches` (appending numbers to *every* dictionary match, not just
+  the bare prefix) is **off by default** — it multiplies by the match count and
+  is a large, low-hit volume driver.
 
 ### Known directories (seeded, not fuzzed)
 
@@ -85,11 +119,20 @@ negligible recall loss, because the dictionary prefix-match is untouched.
   **dictionary matches** (`contract`, `contractor`). So an app compound whose
   base word runs past 6 chars — `contractmanager`, `contract_manager`,
   `exportdata` — can't be built by any pass, including `--loud`. With this flag,
-  each curated suffix is also glued onto every dictionary match (joiners `""`
-  and `"_"`), bounded by `MAX_COMPOUND_NAME`. It uses the small curated list (not
+  each curated suffix is also glued onto every dictionary match with each
+  **joiner**, bounded by `MAX_COMPOUND_NAME`. It uses the small curated list (not
   the loud union), but still multiplies by the match count — e.g. a truncated
   `CONTRA~1` goes from ~1.4k to ~15k candidates. Off by default; reach for it on
   a stubborn truncated stem where the real name is clearly a compound.
+  - **`--compound-joiners`** sets the joiners (default `'' '_' '-'`, i.e.
+    `contractmanagement` / `contract_management` / `contract-management`). Pass
+    the token `empty` for direct concatenation and `space` for `%20`, e.g.
+    `--compound-joiners empty _ space`. A real spaced name — `Contract
+    Management.pdf` — strips its spaces for the 8.3 short name, so it collapses to
+    the **same** `CONTRA~1` as `contractmanagement` and is reachable over HTTP
+    only as `contract%20management.pdf`. `%20` is **not** in the default set (it's
+    another ×1.3 on an already heavy pass); add it on document-heavy targets
+    where spaced names are likely.
 
 The startup line reports which mode is active, e.g.
 `loaded 344 suffix words (curated), …` vs `… (loud), …`.
@@ -105,16 +148,22 @@ on). Code/config extensions like `.cs` and `.js` are *not* treated as assets.
 
 Some real names can never come out of the candidate generator, because it only
 builds **dot-free** stems. A file with an internal dot or a double extension
-(`default.aspx.cs` → short name `DEFAUL~1.CS`) or a long extension truncated to
-three chars (`web.config` → `WEB~1.CON`) is structurally impossible for it to
-produce — even under `--loud`.
+(`default.aspx.cs` → short name `DEFAUL~1.CS`), a long extension truncated to
+three chars (`web.config` → `WEB~1.CON`), or a **leading-dot dotfile**
+(`.gitignore` → short name `GITIGN~1`, `.env` → `ENV~1`) is structurally
+impossible for it to produce — even under `--loud`. (Windows drops the leading
+dot before deriving the 8.3 name, so a dotfile is extension-less and the
+generator would only ever build `gitignore`, never `.gitignore`.)
 
 So before the expensive loud retry, shortloop runs a **custom full-name pass**
 over the unresolved short names: a small curated list (`CUSTOM_NAMES` in the
 script — `web.config`, `web.conf`, `default.aspx.cs`,
 `default.aspx.designer.cs`, `default.master.cs`, `defaultcontroller.cs`,
+dotfiles like `.gitignore` / `.gitconfig` / `.env` / `.htaccess` and
+source-control dirs like `.git` / `.svn` / `.vs`,
 plus extension-less dirs like `pki-validation` / `acme-challenge`, …).
-Extension-less entries only ever match **dir-like** short names, and are probed
+Extension-less entries (including dotfiles) only ever match **dir-like** short
+names, and are probed
 as both a file and a directory so a hit is classified correctly and recursed.
 Only the entries whose reconstructed 8.3 name **collides** with an unresolved
 short name are fired (dedot the base → first 6 chars for the stem, final
@@ -129,6 +178,75 @@ the loud retry; anything it misses falls through unchanged.
 Example: in a run where the root left `WEB~1.CON` and `DEFAUL~1.CS` unresolved,
 the custom pass fires 15 targeted candidates instead of the ~38k loud set, and
 only a genuinely unknown short name like `PKI-VA~1` still needs the loud retry.
+
+### Confirmed but unservable (server-blocked extensions)
+
+Some short names can never be confirmed by ffuf no matter how many candidates you
+throw at them — not because the name is hard to guess, but because IIS/ASP.NET
+**refuses to serve the extension at all**. `.config`, `.cs`, `.vb`, `.master`,
+`.asax`, `.ascx`, `.resx`, `.csproj`, … are mapped to `System.Web.HttpForbiddenHandler`
+(or denied by IIS Request Filtering), so a direct request returns a block page —
+*"This type of page is not served."* or an HTTP 404.7 — instead of the file.
+
+The catch that makes brute force pointless here: **the block fires on the
+extension, not the file**. A request for a random non-existent `whatever.config`
+returns the *same* block page as a real `web.config`. So the response proves
+nothing about existence and never reveals the full name — ffuf can neither fetch
+these nor tell which candidate is real. shortscan's 8.3 enumeration is the only
+proof the file is there.
+
+So before the fan-out, shortloop detects which of these extensions **this
+particular server** actually blocks, with **one control request per extension**
+(a guaranteed-nonexistent `shortloop-nx-<rand>.<ext>`, matched purely on the
+block-page body signature). Then:
+
+- **extension blocked** → before writing anything off, shortloop still fires each
+  blocked short name's **best-guess name(s) once, with normal matching** — a
+  reachability check, because a *specific* file can occasionally be served even
+  when a random one isn't (source-disclosure quirks, a static mapping, a
+  `<location>` override, a served backup). `web.config` in particular turns up
+  viewable in odd setups. Anything that actually responds is recorded and
+  recursed like any other hit. Only the short names that *still* don't resolve
+  are set aside as **unservable**: confirmed to exist (shortscan saw it), full
+  name not recoverable over HTTP. Those are excluded from the broad fan-out and
+  from the custom and loud `--last-chance` passes (all of which would just
+  re-hit the same block — thousands of requests that structurally cannot
+  confirm). They're reported in their own end-of-run bucket, with the best-guess
+  hints from the candidate generator, and written to `<output>.unservable` when
+  `-o` is set:
+
+  ```
+  ==> 2 unservable - exist (shortscan) but the extension is server-blocked; name not fetchable over HTTP
+    https://target/app/  [PACKAG~1.CON]  .config blocked  ~ packages.config, package.config, ...
+    https://target/app/  [MAIN~1.MAS]    .master blocked  ~ main.master
+  ```
+
+- **extension not blocked** (a misconfigured server that really does serve
+  `.config`) → the control comes back clean and those short names stay in the
+  normal pipeline, so an unexpectedly-served copy is still confirmed and recursed
+  like any other hit. No recall is lost.
+
+The hints are the generator's best completions (dictionary prefix-matches on the
+stem, plus the bare stem, with the blocked extension pinned on) — e.g.
+`PACKAG~1.CON` → `packages.config`. They are **reported, not asserted**: the
+server can't tell us which one is real, so shortloop never claims a specific
+confirmed name for an unservable short name.
+
+- Cheap: zero extra requests in directories with no protected-extension short
+  names; otherwise one control request per distinct protected extension, plus —
+  only when an extension is actually blocked — a few best-guess names per blocked
+  short name for the reachability check. Still a tiny fraction of the fan-out and
+  loud retry it replaces.
+- The regex probe uses `ffuf -mmode and -mc all -mr <signature>` (and no `-ac`),
+  so a wildcard-200 server can't produce a false "blocked", and the block page
+  can't be auto-calibrated away as noise.
+- **`--no-unservable-check`** disables the probe entirely; protected short names
+  then flow through the normal pipeline and land in **unconfirmed** as before.
+
+The real prize for a blocked `.config` is usually a **served backup** that
+bypasses the extension block — `packages.config.bak` / `.old` / `.txt` are served
+normally and leak the full contents. Those surface as *different* short names
+(`.BAK`, `.OLD`, `.TXT`) and go through the normal confirmation path.
 
 ### `--last-chance` and unconfirmed short names
 
@@ -240,6 +358,41 @@ python3 shortloop.py https://target/ --max-depth 0 --only '*.ZIP'
 `--only` filters the names shortscan reports; seeded default-directory contents
 (`aspnet_client/`, …) are unaffected.
 
+### Manual insertion-point fuzzing (`--insertion-point`)
+
+Sometimes shortscan proves a file exists but the candidate generator can't
+rebuild the name, because the unknown tail isn't a dictionary word —
+`REQUIR~1.ZIP` (`require` + something), `DELETE~1.BAT`. When you can see the
+**shape** of the real name, `--insertion-point` lets you fuzz just the unknown
+span yourself instead of relying on the wordlist fan-out.
+
+It takes a relative template under the base URL with the literal keyword `FUZZ`
+marking the spot. Each `--insertion-wordlist` entry is substituted for `FUZZ`,
+and the results go through the **same** pipeline as everything else — file-vs-
+directory classification, `-o` recording, and recursion into any directory the
+fuzz turns up (honouring `--max-depth`). shortscan and the candidate generator
+are skipped entirely; this is a pure, operator-driven ffuf pass.
+
+```bash
+# complete require<tail>.zip against the directory that reported REQUIR~1.ZIP
+python3 shortloop.py https://target/_resources/ \
+    --insertion-point 'requireFUZZ.zip' --max-depth 0
+
+# a .bat whose tail you want to brute from a custom list
+python3 shortloop.py https://target/_resources/ \
+    --insertion-point 'deleteFUZZ.bat' --insertion-wordlist ./tails.txt --max-depth 0
+
+# the FUZZ can sit anywhere in the template: prefix, middle, or extension
+python3 shortloop.py https://target/ --insertion-point 'FUZZ.bak'
+```
+
+- The keyword is the literal, case-sensitive string `FUZZ` (ffuf's convention).
+- A template that doesn't look like a file (no known extension) is also probed
+  as a directory, so `backupFUZZ` finds both `backup01` and a `backup01/` dir.
+- Default wordlist is raft-small-words; override with `--insertion-wordlist`.
+- `--max-depth 0` keeps it a one-shot; a higher depth shortscans any directory
+  the fuzz discovers, rejoining the normal recursive pipeline.
+
 Common options:
 
 | flag | meaning |
@@ -252,19 +405,24 @@ Common options:
 | `--claude-timeout N` | max seconds for a single `claude -p` call (default 120) |
 | `--max-depth N` | recursion depth (default 4; `0` = scan only the given directory) |
 | `--only PATTERN...` | only process short names whose label matches a case-insensitive glob (`'CONTRA*'`, `'*.ZIP'`); skip the rest. Pair with `--max-depth 0` to target one name |
+| `--insertion-point TEMPLATE` | manual fuzz mode: skip shortscan/candidate-gen and fire a wordlist at a single insertion point, where `FUZZ` marks the spot (`'requireFUZZ.zip'`). Hits are classified/recorded/recursed like any other. See [Manual insertion-point fuzzing](#manual-insertion-point-fuzzing---insertion-point) |
+| `--insertion-wordlist FILE...` | wordlist(s) substituted into the `--insertion-point` `FUZZ` keyword (default raft-small-words) |
 | `-H 'Header: v'` | extra request header (repeatable) |
 | `-x http://127.0.0.1:8080` | proxy through Burp |
 | `-t N` / `--rate N` | threads / ffuf req-per-sec cap |
 | `--no-numbers` | disable numeric candidates |
 | `--max-number N` / `--year-start` / `--year-end` | tune numeric range |
-| `--no-number-matches` | numbers on the bare prefix only (lower volume) |
+| `--number-matches` | also append numbers to every dictionary match, not just the bare prefix (off by default — large, low-hit volume driver) |
+| `--probe-dirs` | also fire the explicit `name/` directory probe for extension-less names; off by default (a dir 301-redirects `name` → `name/`, so the slash probe is usually redundant and doubles the count) — see [Tiered fan-out](#tiered-fan-out) |
 | `--loud` / `--full-suffixes` | union the full `--suffix-wordlists` file(s) into the curated list for max recall (~150× volume); off by default |
 | `--compound-stems` | also append the curated suffix words to the dictionary stem matches (not just the bare prefix), reaching compounds like `contract`+`manager` / `export`+`data`; higher volume, off by default |
+| `--compound-joiners JOINER...` | joiners between stem match and suffix under `--compound-stems` (default `'' '_' '-'`); tokens `empty` = direct concat, `space` = `%20` for spaced names, e.g. `--compound-joiners empty _ space` |
 | `--resolve-assets` | also try to recover CSS/image full names; by default short names with a `css`/`png`/`jpg`/`gif`/`ico`/`svg`/… extension are skipped as low-value static assets |
 | `--last-chance` | auto-run the end-of-run loud retry on unresolved short names (otherwise you're prompted at a terminal) |
 | `--no-last-chance` | never retry and never prompt; just list the unresolved short names |
 | `--custom-wordlists ...` | extra file(s) of full real names (`web.config`, `Default.aspx.cs`) fired at unresolved short names before the loud retry; merged with the built-in `CUSTOM_NAMES` |
 | `--no-custom` | skip the custom full-name pass before the loud retry |
+| `--no-unservable-check` | skip the server-blocked-extension probe; by default short names whose extension IIS refuses to serve (`.config`/`.cs`/`.master`/…) are detected with one control request each and reported as [unservable](#confirmed-but-unservable-server-blocked-extensions) instead of being fuzzed and loud-retried in vain |
 | `--suffix-wordlists ...` | full word list appended after the prefix **when `--loud` is set** (default raft-small-words); ignored otherwise — the default uses the curated `COMMON_SUFFIXES` |
 | `--stem-wordlists ...` / `--ext-wordlists ...` | swap the dictionary prefix-match / extension lists (defaults: raft-medium) |
 
@@ -275,7 +433,11 @@ short-name prefix (never standalone), to keep request volume sane:
 
 - `prefix + digits`  (`backup` → `backup1`, `backup07`, `backup99`)
 - `prefix + years`   (`backup` → `backup2024`)
-- `matched word + light number set` (toggle with `--no-number-matches`)
+- `matched word + light number set` — **off by default**, enable with
+  `--number-matches` (it multiplies by the dictionary-match count)
+
+Numeric candidates live in [tier 2](#tiered-fan-out), so they only fire at short
+names the cheap tier-1 pass didn't already resolve.
 
 ## Requires
 

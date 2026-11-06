@@ -80,8 +80,11 @@ def banner(msg, depth=0):
 # shortscan result model
 # --------------------------------------------------------------------------- #
 
-@dataclass
+@dataclass(eq=False)
 class ShortName:
+    # eq=False keeps identity-based __eq__/__hash__ so instances stay hashable
+    # (usable as dict keys / set members in the tiered fan-out). We always key on
+    # the exact objects produced per directory, so identity is the right notion.
     baseurl: str          # directory URL, guaranteed to end with "/"
     shortfile: str        # stem, uppercase, <=6
     shortext: str         # extension incl. leading dot, uppercase, or ""
@@ -124,10 +127,30 @@ SECLISTS = "/opt/SecLists/Discovery/Web-Content"
 # real name -- cap it to trim the long tail, especially under --loud.
 MAX_COMPOUND_NAME = 24
 
-# Joiners used when gluing a common-suffix word onto a dictionary stem match
-# under --compound-stems (contract+management -> contractmanagement,
-# contract_management). "" and "_" are by far the most common on Windows/IIS.
-COMPOUND_JOINERS = ("", "_")
+# Default joiners used when gluing a common-suffix word onto a dictionary stem
+# match under --compound-stems (contract+management -> contractmanagement,
+# contract_management, contract-management). "", "_" and "-" are by far the most
+# common on Windows/IIS. Overridable with --compound-joiners.
+COMPOUND_JOINERS = ("", "_", "-")
+
+# Friendly tokens for joiners that are awkward to pass literally on a shell:
+# an empty string (direct concatenation) and a URL-encoded space. A real spaced
+# name like "contract management" strips its spaces for the 8.3 short name, so it
+# collapses to the same short name as "contractmanagement" and is reachable only
+# by requesting "contract%20management".
+JOINER_TOKENS = {"empty": "", "none": "", "cat": "", "space": "%20"}
+
+
+def normalize_joiners(raw):
+    """Map friendly tokens (empty/none/cat -> "", space -> %20) to real joiner
+    strings, leaving anything else literal, and dedupe while preserving order."""
+    out, seen = [], set()
+    for j in raw:
+        j = JOINER_TOKENS.get(j.lower(), j)
+        if j not in seen:
+            seen.add(j)
+            out.append(j)
+    return out
 
 # Curated common-suffix list: the words people actually tack onto a name to form
 # a compound directory/file (streem + ALERT, order + DETAILS, ...). This is the
@@ -252,8 +275,9 @@ def load_wordlists(args):
     log(dim(f"loaded {len(suffixes)} suffix words ({mode}), {len(stems)} stems, "
             f"{len(exts)} extensions"))
     if args.compound_stems:
+        shown = [("''" if j == "" else j) for j in args.compound_joiners]
         log(dim(f"compound-stems on: suffixing {len(COMMON_SUFFIXES)} curated "
-                f"words onto each dictionary match (joiners {COMPOUND_JOINERS})"))
+                f"words onto each dictionary match (joiners {', '.join(shown)})"))
     return suffixes, stems, exts
 
 
@@ -289,35 +313,45 @@ def _numeric_suffixes(args):
     return out
 
 
-def candidate_stems(sn, stems, suffixes, args):
-    """
-    Return the set of lowercase stem candidates for one short name.
+def _dict_matches(sn, stems):
+    """Whole dictionary words that start with a truncated 6-char prefix
+    (streaming from stream). Empty when the stem is already complete."""
+    if sn.stem_complete:
+        return []
+    pref = sn.stem_prefix
+    return [w for w in stems if w.startswith(pref) and len(w) > len(pref)]
 
-    - complete stem (shortfile < 6 chars) -> the stem is already known exactly.
-    - truncated stem (shortfile == 6 chars) -> the first 6 chars are known and
-      the rest is unknown, so we build:
-        (1) prefix + every suffix word   (streem + alert = streemalert)  <-- core
-        (2) whole dictionary words that start with the prefix (streaming), which
-            (1) would miss because "ing" is not a standalone word
-        (3) the bare prefix (real name may be exactly 6 chars)
-        (4) numeric completions (prefix+digits/years, and optionally the same on
-            prefix-matched words)
-    """
+
+def candidate_stems_tier1(sn, stems):
+    """Tier-1 (cheap, high-hit) stem candidates: the bare prefix plus the whole
+    dictionary words that start with it. The dictionary prefix-match lands most
+    real English-word names (streaming, orderdetails, shipping), so firing these
+    FIRST means a name that resolves here never pays for the tier-2 fan-out
+    below. A complete stem is itself the only candidate."""
     if sn.stem_complete:
         return {sn.stem_prefix}
+    return {sn.stem_prefix, *_dict_matches(sn, stems)}
+
+
+def candidate_stems_tier2(sn, stems, suffixes, args):
+    """Tier-2 (expensive fan-out) stem candidates, fired ONLY at short names that
+    tier 1 left unresolved:
+        (1) prefix + every suffix word   (streem + alert = streemalert)
+        (2b) optional compound completion on the dictionary matches
+        (3)/(4) numeric completions (prefix+digits/years, optionally on matches)
+    Empty for a complete stem -- once the stem is known exactly there is nothing
+    left to fan out."""
+    if sn.stem_complete:
+        return set()
 
     pref = sn.stem_prefix
-    out = {pref}  # the real name might be exactly the 6-char prefix
+    out = set()
 
     # (1) the core IIS short-name technique: complete the known prefix with each
     #     word from the suffix list  ->  streem + alert -> streemalert
     #     (skip absurdly long compounds -- real names rarely run this long)
     out.update(pref + w for w in suffixes
                if len(pref) + len(w) <= MAX_COMPOUND_NAME)
-
-    # (2) real dictionary names that begin with the prefix (streaming from stream)
-    matched = [w for w in stems if w.startswith(pref) and len(w) > len(pref)]
-    out.update(matched)
 
     # (2b) compound completion ON the dictionary matches (opt-in): glue the
     #      curated common-suffix words onto each matched word, so we can reach
@@ -326,10 +360,11 @@ def candidate_stems(sn, stems, suffixes, args):
     #      bare 6-char prefix, so these are otherwise unreachable. Deliberately
     #      uses the small COMMON_SUFFIXES (never the loud union) to keep volume
     #      bounded -- it already multiplies by the number of matches.
+    matched = _dict_matches(sn, stems)
     if args.compound_stems:
         for m in matched:
             for w in COMMON_SUFFIXES:
-                for j in COMPOUND_JOINERS:
+                for j in args.compound_joiners:
                     cand = m + j + w
                     if len(cand) <= MAX_COMPOUND_NAME:
                         out.add(cand)
@@ -345,6 +380,13 @@ def candidate_stems(sn, stems, suffixes, args):
                 for s in light:
                     out.add(w + s)
     return out
+
+
+def candidate_stems(sn, stems, suffixes, args):
+    """Full stem candidate set (tier 1 u tier 2). Used by the single-pass loud
+    last-chance retry, where the whole set is fired at once by design."""
+    return candidate_stems_tier1(sn, stems) | candidate_stems_tier2(
+        sn, stems, suffixes, args)
 
 
 # Truncated 3-char extensions pinned to a short, curated set of the real
@@ -365,6 +407,9 @@ MAIN_EXT = {
     ".res": [".resx"],
     ".con": [".config", ".conf"],
     ".dll": [".dll"],
+    ".pdb": [".pdb"],
+    ".bat": [".bat"],
+    ".cmd": [".cmd"],
     # other server-side pages
     ".php": [".php"],
     ".htm": [".html"],
@@ -388,17 +433,23 @@ MAIN_EXT = {
 }
 
 
-def candidate_exts(sn, exts):
+def candidate_exts(sn, exts, probe_dirs=False):
     """
     Return extension candidates for one short name.
 
     Special sentinels:
-      ""      -> test the bare stem (ext-less file)
-      "/"     -> test the stem as a directory  (stem + "/")
+      ""      -> test the bare stem (ext-less file, or a directory via redirect)
+      "/"     -> test the stem as an explicit directory  (stem + "/")
     Otherwise a real extension including the leading dot, e.g. ".aspx".
+
+    For an extension-less (dir-like) short name we fire only the BARE stem by
+    default. A real directory reveals itself by 301-redirecting name -> name/,
+    which classify() already keys on, so the explicit name/ probe is redundant
+    and doubles the request count for the most common short-name shape.
+    --probe-dirs restores it for the rare server where name 404s but name/ answers.
     """
     if sn.is_dir_like:
-        return {"", "/"}                 # could be a directory or an ext-less file
+        return {"", "/"} if probe_dirs else {""}
     if sn.ext_complete:
         return {sn.shortext.lower()}     # we know the whole extension
     pref = sn.shortext.lower()
@@ -413,29 +464,90 @@ def candidate_exts(sn, exts):
     return out
 
 
+def _fullname_candidates(sn):
+    """The one resolved name shortscan already handed us (plus a dir probe when
+    it has no file extension). None when shortscan didn't resolve it."""
+    if not sn.fullname:
+        return None
+    fn = sn.fullname.lower()
+    cands = {fn}
+    if not _looks_like_file(fn):
+        cands.add(fn + "/")
+    return cands
+
+
+def _cross_stems_exts(stem_set, cex):
+    """Cartesian product stem x ext -> relative candidate names."""
+    names = set()
+    for st in stem_set:
+        for ex in cex:
+            names.add(st + "/" if ex == "/" else st + ex)
+    return names
+
+
 def build_candidates(sn, suffixes, stems, exts, args):
-    """Cartesian product stem x ext -> relative candidate names for ffuf."""
+    """Full single-pass candidate set (tier 1 u tier 2). Used by the loud
+    last-chance retry; the normal pass uses the tiered builders below."""
     # if shortscan already resolved the full name, trust it and skip the whole
     # wordlist fan-out -- there's nothing left to guess, just verify the one name.
-    # Probe it as a directory too ONLY when it has no file extension; a resolved
-    # page like "default.aspx" is a file, and firing "default.aspx/" just invites
-    # the IIS PathInfo quirk that makes it look like a directory.
-    if sn.fullname:
-        fn = sn.fullname.lower()
-        cands = {fn}
-        if not _looks_like_file(fn):
-            cands.add(fn + "/")
-        return sorted(cands)
-
-    names = set()
+    fc = _fullname_candidates(sn)
+    if fc is not None:
+        return sorted(fc)
     cst = candidate_stems(sn, stems, suffixes, args)
-    cex = candidate_exts(sn, exts)
-    for st in cst:
-        for ex in cex:
-            if ex == "/":
-                names.add(st + "/")      # directory probe
-            else:
-                names.add(st + ex)       # file probe ("" ext -> bare stem)
+    cex = candidate_exts(sn, exts, args.probe_dirs)
+    return sorted(_cross_stems_exts(cst, cex))
+
+
+def build_candidates_tier1(sn, stems, exts, args):
+    """Tier-1 relative candidate names (cheap, fired first): the shortscan
+    fullname if any, else bare prefix + dictionary prefix-matches crossed with
+    the extension candidates."""
+    fc = _fullname_candidates(sn)
+    if fc is not None:
+        return set(fc)
+    cex = candidate_exts(sn, exts, args.probe_dirs)
+    return _cross_stems_exts(candidate_stems_tier1(sn, stems), cex)
+
+
+def build_candidates_tier2(sn, stems, suffixes, exts, args):
+    """Tier-2 relative candidate names (the fan-out), fired only at short names
+    tier 1 didn't resolve. Empty when shortscan already gave the full name."""
+    if sn.fullname:
+        return set()
+    cex = candidate_exts(sn, exts, args.probe_dirs)
+    return _cross_stems_exts(candidate_stems_tier2(sn, stems, suffixes, args), cex)
+
+
+# --------------------------------------------------------------------------- #
+# manual insertion-point fuzzing (bypasses shortscan/candidate generation)
+# --------------------------------------------------------------------------- #
+#
+# When shortscan proves a file exists but the generator can't rebuild its name
+# (REQUIR~1.ZIP, DELETE~1.BAT: the tail isn't a dictionary word), the operator
+# usually has a good guess at the SHAPE -- "require<something>.zip". This mode
+# lets them fuzz just the unknown span: a relative template with the literal
+# keyword FUZZ marking the insertion point ("requireFUZZ.zip"), each wordlist
+# entry substituted in, then fired through the SAME ffuf -> classify -> emit path
+# as everything else (so file/dir detection, -o recording and recursion into any
+# discovered directory all still apply).
+
+FUZZ_KEYWORD = "FUZZ"
+
+
+def build_insertion_candidates(template, words):
+    """Expand a FUZZ-marked template into concrete relative candidate names by
+    substituting each wordlist entry for the FUZZ keyword. A non-file-looking
+    expansion also gets a trailing-slash directory probe, mirroring
+    build_candidates, so a directory hit is classified and recursed correctly."""
+    names = set()
+    for w in words:
+        w = w.strip()
+        if not w:
+            continue
+        name = template.replace(FUZZ_KEYWORD, w)
+        names.add(name)
+        if not name.endswith("/") and not _looks_like_file(name):
+            names.add(name + "/")
     return sorted(names)
 
 
@@ -514,6 +626,9 @@ def seed_candidates(url):
 # simply cannot build:
 #   * an internal dot / double extension -- default.aspx.cs -> short DEFAUL~1.CS
 #   * a long extension truncated to 3 chars -- web.config -> short WEB~1.CON
+#   * a leading-dot dotfile -- .gitignore -> short GITIGN~1 (the leading dot is
+#     dropped by Windows, so it's extension-less; candidate_stems would only ever
+#     emit "gitignore", never ".gitignore")
 # candidate_stems only ever emits dot-free stems, so these never appear in the
 # normal OR the loud pass. We fire them at the UNRESOLVED short names (filtered
 # by 8.3 match) BEFORE paying for the loud fan-out: it's a few requests instead
@@ -526,10 +641,20 @@ CUSTOM_NAMES = [
     "default.ascx.cs",
     "defaultcontroller.cs", "defaulthandler.cs", "defaultmodule.cs",
     "defaultmodel.cs", "defaultmembershipprovider.cs", "defaultroleprovider.cs",
+    # dotfiles: a leading-dot name is extension-less to Windows 8.3 (GITIGN~1 for
+    # .gitignore, ENV~1 for .env), so the generator can never build it. These are
+    # high value -- source-control metadata, secrets, server config -- and leak
+    # readily when IIS serves the raw file. Extension-less, so they only match
+    # dir-like short names and get probed as both a file and a directory.
+    ".gitignore", ".gitattributes", ".gitmodules", ".gitconfig", ".git",
+    ".env", ".env.local", ".env.production", ".env.development",
+    ".htaccess", ".htpasswd", ".dockerignore", ".editorconfig",
+    ".npmrc", ".yarnrc", ".ds_store",
+    ".vs", ".vscode", ".svn", ".hg", ".idea",
     # .well-known validation dirs (extension-less -> only match dir-like short
     # names). pki-validation is the standard ACME/SSL domain-validation folder
     # (short name PKI-VA~1); acme-challenge is its HTTP-01 sibling.
-    "pki-validation", "acme-challenge",
+    ".well-known", "pki-validation", "acme-challenge",
 ]
 
 
@@ -547,8 +672,13 @@ def load_custom_names(args):
 def _name_83(name):
     """Derive the (stem, ext) 8.3 fragments a Windows short name would expose for
     a full filename: stem = first 6 chars of the base with all dots removed; ext
-    = the final extension including the dot (or "" when there is none)."""
-    name = name.strip().lower()
+    = the final extension including the dot (or "" when there is none).
+
+    Leading dots are stripped first, because Windows drops them before deriving
+    the short name -- which is exactly why a dotfile like ".gitignore" shows up as
+    the extension-less short name GITIGN~1 (stem "gitign", no ext), and ".env" as
+    ENV~1, rather than as a file whose extension is ".gitignore"."""
+    name = name.strip().lower().lstrip(".")
     if "." in name:
         base, last = name.rsplit(".", 1)
         ext = "." + last
@@ -789,8 +919,12 @@ def run_shortscan(url, args, depth):
     return shortnames, vulnerable
 
 
-def run_ffuf(baseurl, candidates, args, depth):
-    """Fuzz candidate names under baseurl; return list of confirmed ffuf hits."""
+def run_ffuf(baseurl, candidates, args, depth, match_regex=None):
+    """Fuzz candidate names under baseurl; return list of confirmed ffuf hits.
+
+    match_regex (optional): match purely on a response-body regex instead of the
+    status codes -- used to detect the server-side "this extension is blocked"
+    page, whose status (often 404) isn't in the normal match set."""
     if not candidates:
         return []
 
@@ -805,12 +939,19 @@ def run_ffuf(baseurl, candidates, args, depth):
             args.ffuf_bin,
             "-w", f"{wl.name}:FUZZ",
             "-u", f"{baseurl}FUZZ",
-            "-mc", args.match_codes,
-            "-ac",                       # auto-calibrate to drop wildcard noise
             "-t", str(args.threads),
             "-s",                        # silent; we render our own output
             "-o", out.name, "-of", "json",
         ]
+        if match_regex:
+            # match purely on the body signature (-mmode and + -mc all), ignoring
+            # the status code, so a control name only "hits" when the response
+            # actually carries the block signature -- not because the server
+            # wildcard-serves everything. No -ac: the block page must not be
+            # auto-calibrated away as noise.
+            cmd += ["-mr", match_regex, "-mc", "all", "-mmode", "and"]
+        else:
+            cmd += ["-mc", args.match_codes, "-ac"]  # -ac drops wildcard noise
         if args.rate:
             cmd += ["-rate", str(args.rate)]
         for h in args.header:
@@ -856,7 +997,7 @@ def run_ffuf(baseurl, candidates, args, depth):
 FILE_EXTS = {
     # ASP.NET / IIS
     "aspx", "asp", "ashx", "asmx", "asax", "ascx", "axd", "master", "cshtml",
-    "vbhtml", "config", "cs", "vb", "dll", "pdb", "resx", "svc",
+    "vbhtml", "config", "cs", "vb", "dll", "pdb", "resx", "svc", "bat", "cmd",
     # other server pages / scripts
     "php", "php3", "php4", "php5", "jsp", "jspx", "do", "action", "cgi", "pl",
     "py", "rb", "sh", "cfm",
@@ -897,6 +1038,100 @@ def _is_asset_shortname(sn):
     """True when a short name's extension marks it as a CSS or image file."""
     ext = sn.shortext.lstrip(".").lower()
     return bool(ext) and ext[:3] in ASSET_EXT_PREFIXES
+
+
+# --------------------------------------------------------------------------- #
+# protected (server-blocked) extensions: confirmed-but-unservable
+# --------------------------------------------------------------------------- #
+#
+# IIS/ASP.NET refuses to serve these extensions to the web: System.Web
+# .HttpForbiddenHandler ("This type of page is not served.") or IIS Request
+# Filtering (HTTP 404.7, "...configured to deny the file extension"). The block
+# fires on the EXTENSION, so a request for a non-existent name.config returns the
+# SAME page as a real web.config -- the response proves nothing about existence
+# and never reveals the full name. So ffuf can neither fetch nor recover these;
+# shortscan's 8.3 enumeration is the only proof the file is there. We detect the
+# ones this server actually blocks (one control request per extension), then
+# report the matching short names as "unservable" (exist per shortscan, name not
+# HTTP-recoverable) instead of wasting the fan-out and the loud retry on them.
+PROTECTED_EXTS = {
+    "config", "cs", "vb", "master", "ascx", "asax", "skin", "browser",
+    "sitemap", "resx", "resources", "csproj", "vbproj", "vjsproj", "webinfo",
+    "licx", "exclude", "refresh", "compiled", "vsdisco", "rules", "cd", "dd",
+    "ad", "soap", "mdf", "ldf", "mdb", "java", "jsl", "cer",
+}
+
+# Response-body signatures for the two server-side blocks above (ffuf -mr regex).
+FORBIDDEN_SIGNATURE = (
+    r"(This type of page is not served"
+    r"|request filtering module is configured to deny the file extension"
+    r"|HTTP Error 404\.7"
+    r"|HTTP Error 404\.3)"
+)
+
+
+def protected_ext_of(sn):
+    """If short name `sn`'s extension resolves to a server-blocked ASP.NET type,
+    return that extension (e.g. "config", "master", "cs"); else None. Mirrors
+    candidate_exts' pinning so a truncated ".CON" -> ".config" is recognised."""
+    if sn.is_dir_like:
+        return None
+    if sn.ext_complete:
+        ext = sn.shortext.lstrip(".").lower()
+        return ext if ext in PROTECTED_EXTS else None
+    # truncated ".XYZ": prefer the hand-pinned real extension(s), else the bare
+    # 3-char prefix itself may already be a protected extension.
+    pref = sn.shortext.lower()
+    pinned = MAIN_EXT.get(pref)
+    if pinned:
+        for e in pinned:
+            e = e.lstrip(".").lower()
+            if e in PROTECTED_EXTS:
+                return e
+        return None
+    bare = pref.lstrip(".")
+    return bare if bare in PROTECTED_EXTS else None
+
+
+def probe_blocked_exts(url, exts, args, depth):
+    """Fire one guaranteed-nonexistent control name per extension and see which
+    ones come back with a server-block signature. Returns the subset of `exts`
+    the server refuses to serve (so a real file of that type is unfetchable and
+    its full name unrecoverable over HTTP)."""
+    if not exts:
+        return set()
+    token = os.urandom(4).hex()
+    controls = {f"shortloop-nx-{token}.{ext}".lower(): ext for ext in exts}
+    hits = run_ffuf(url, sorted(controls), args, depth,
+                    match_regex=FORBIDDEN_SIGNATURE)
+    blocked = set()
+    for h in hits:
+        name = ((h.get("input") or {}).get("FUZZ", "") or "").lower()
+        if name in controls:
+            blocked.add(controls[name])
+    return blocked
+
+
+def unservable_hints(sn, stems, ext, limit=5):
+    """Best-guess full names for an unservable short name (informational only):
+    the bare stem plus dictionary words that start with a truncated stem, each
+    with the blocked extension -- e.g. PACKAG~1.CON -> packages.config, ..."""
+    pref = sn.stem_prefix
+    if sn.stem_complete:
+        bases = [pref]
+    else:
+        matched = sorted(w for w in stems
+                         if w.startswith(pref) and len(w) > len(pref))
+        bases = [pref] + matched
+    seen, out = set(), []
+    for b in bases:
+        name = f"{b}.{ext}"
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def classify(hits, baseurl):
@@ -1010,6 +1245,13 @@ def main():
     confirmed_seen = set()
     unconfirmed = []             # (url, depth, ShortName) seen by shortscan but
                                  # not recovered
+    unservable = []              # (url, depth, ShortName, ext, hints) exist per
+                                 # shortscan but the extension is server-blocked
+    vocab = set()                # run-global confirmed relative names (basenames,
+                                 # lowercased, no trailing slash): the same app
+                                 # reuses its vocabulary across directories, so
+                                 # these are retried first (tier 1) on recursion
+    requests_fired = [0]         # running tally of candidates sent to ffuf
 
     def record(url):
         if url not in confirmed_seen:
@@ -1024,16 +1266,28 @@ def main():
         for name, status in sorted(files.items()):
             full = url + name
             record(full)
+            vocab.add(name.lower())              # seed run-global vocabulary
             log(f"{green('FILE')} [{status}] {full}", depth)
         for name, status in sorted(dirs.items()):
             full = url + name + "/"
             record(full)
+            vocab.add(name.lower())
             log(f"{green('DIR ')} [{status}] {full}", depth)
             if depth + 1 <= args.max_depth and full not in visited:
                 queue.append((full, depth + 1))
 
     def candset(cands):
         return {c.rstrip("/").lower() for c in cands}
+
+    def fire(url, candidates, depth, **kw):
+        """run_ffuf wrapper that tallies how many candidates we send."""
+        requests_fired[0] += len(candidates)
+        return run_ffuf(url, candidates, args, depth, **kw)
+
+    def vocab_matches(sn):
+        """Confirmed names seen elsewhere this run whose 8.3 collides with `sn` --
+        cheap, high-signal tier-1 candidates on a recursive same-app scan."""
+        return {v for v in vocab if custom_matches(sn, v)}
 
     def claude_first_pass(url, shortnames, depth):
         """Ask Claude for targeted guesses, ffuf them, record hits, and return
@@ -1063,7 +1317,7 @@ def main():
 
         log(f"{blue('claude')} {len(guesses)} guess(es) -> {len(cand_pool)} "
             f"matched candidate(s) for {len(shortnames)} short name(s)", depth)
-        hits = run_ffuf(url, sorted(cand_pool), args, depth)
+        hits = fire(url, sorted(cand_pool), depth)
         files, dirs = classify(hits, url)
         emit(files, dirs, depth, url)
 
@@ -1103,17 +1357,15 @@ def main():
                         + ", ".join(sn.label() for sn in assets)), depth)
 
         seeds = seed_candidates(url)
-        all_candidates = set()
-        sn_candsets = []         # [(ShortName, candidate-basename set)] non-seed
 
         if seeds is not None:
             # known default directory: test its curated contents directly and
             # skip the broad wordlist fan-out (the names here can't be rebuilt
-            # from dictionary words anyway).
-            all_candidates.update(seeds)
+            # from dictionary words anyway). No tiering / unconfirmed tracking --
+            # these are trusted seed names, fired in one pass.
+            all_candidates = set(seeds)
             log(f"{green('known dir')} -> seeding {len(seeds)} expected name(s), "
                 f"{dim('skipping wordlist fan-out')}", depth)
-            # still keep anything shortscan fully resolved on its own
             for sn in shortnames:
                 if sn.fullname:
                     fn = sn.fullname.lower()
@@ -1121,11 +1373,76 @@ def main():
                     all_candidates.add(fn + "/")
                     log(f"{yellow(sn.label())} {dim('(shortscan: ' + sn.fullname + ')')}",
                         depth)
-        else:
-            if not shortnames:
-                if vulnerable:
-                    log(dim("vulnerable but no short names recovered"), depth)
-                return
+            if all_candidates:
+                hits = fire(url, sorted(all_candidates), depth)
+                files, dirs = classify(hits, url)
+                emit(files, dirs, depth, url)
+            return
+
+        # ------------------------- normal directory ------------------------- #
+        if not shortnames:
+            if vulnerable:
+                log(dim("vulnerable but no short names recovered"), depth)
+            return
+
+        if True:
+            # Server-blocked extensions (.config/.cs/.master/...): IIS/ASP.NET
+            # refuses them for ANY name, so ffuf can neither fetch nor recover the
+            # real one -- shortscan already proved the file exists. Detect which
+            # of these extensions THIS server actually blocks (one control request
+            # each) and set the matching short names aside as "unservable" instead
+            # of burning the fan-out and the loud retry on them. A server that
+            # does NOT block the extension leaves them in the normal pipeline, so
+            # an unexpectedly-served copy can still be confirmed.
+            if not args.no_unservable_check:
+                prot_exts = {protected_ext_of(sn) for sn in shortnames
+                             if protected_ext_of(sn)}
+                if prot_exts:
+                    log(dim("probing " + ", ".join("." + e for e in
+                            sorted(prot_exts)) + " for server-side blocking"),
+                        depth)
+                    blocked = probe_blocked_exts(url, prot_exts, args, depth)
+                    if blocked:
+                        blk = [sn for sn in shortnames
+                               if protected_ext_of(sn) in blocked]
+                        kept = [sn for sn in shortnames
+                                if protected_ext_of(sn) not in blocked]
+
+                        # The control proves the extension is blocked for a random
+                        # name, but a SPECIFIC file can still occasionally be
+                        # reachable (source-disclosure quirks, a static mapping, a
+                        # <location> override, a served backup). So fire each
+                        # blocked short name's best-guess name(s) ONCE with normal
+                        # matching before writing it off -- a served copy is
+                        # recorded and recursed like any other hit.
+                        reach_sets, reach_pool = [], set()
+                        for sn in blk:
+                            hints = unservable_hints(sn, stems,
+                                                     protected_ext_of(sn))
+                            reach_sets.append((sn, candset(hints)))
+                            reach_pool.update(hints)
+                        still = blk
+                        if reach_pool:
+                            log(dim(f"reachability check: {len(reach_pool)} "
+                                    f"best-guess name(s) for {len(blk)} "
+                                    f"server-blocked short name(s)"), depth)
+                            rhits = fire(url, sorted(reach_pool), depth)
+                            rf, rd = classify(rhits, url)
+                            emit(rf, rd, depth, url)
+                            still = unconfirmed_shortnames(reach_sets,
+                                                           set(rf) | set(rd))
+
+                        for sn in still:
+                            pe = protected_ext_of(sn)
+                            hints = unservable_hints(sn, stems, pe)
+                            unservable.append((url, depth, sn, pe, hints))
+                            msg = (f".{pe} server-blocked; exists per shortscan, "
+                                   f"name not fetchable")
+                            log(f"{yellow('UNSERVABLE')} "
+                                f"{yellow(sn.label())} {dim(msg)}", depth)
+                        shortnames = kept
+                        if not shortnames:
+                            return
 
             # Claude first (when enabled): a small, reasoned guess list tried
             # before the brute-force fan-out. Whatever it confirms is already
@@ -1136,27 +1453,62 @@ def main():
                 if not pending:
                     return                      # Claude resolved everything here
 
-            # gather all candidates for this directory, remembering which short
-            # name produced each (for the console, and for unconfirmed tracking)
+            # Tiered fan-out. sn_cands[sn] accumulates every candidate actually
+            # fired at that short name, so one-to-one resolution stays honest
+            # across both tiers; `fired` dedups tier 2 against tier 1.
+            sn_cands = {sn: set() for sn in pending}
+            fired = set()
+            confirmed_now = set()
+
+            # ----- tier 1: cheap, high-hit candidates fired at ALL names ----- #
+            # shortscan fullname + bare prefix + dictionary prefix-matches + any
+            # run-global confirmed vocabulary. The dictionary prefix-match lands
+            # most real word-names, so whatever resolves here never pays for the
+            # tier-2 fan-out.
+            t1_pool = set()
             for sn in pending:
-                cands = build_candidates(sn, suffixes, stems, exts, args)
-                all_candidates.update(cands)
-                sn_candsets.append((sn, candset(cands)))
-                log(f"{yellow(sn.label())} -> {len(cands)} candidates"
-                    + (f"  {dim('(shortscan: ' + sn.fullname + ')')}" if sn.fullname else ""),
+                c = build_candidates_tier1(sn, stems, exts, args)
+                c |= vocab_matches(sn)
+                sn_cands[sn] |= candset(c)
+                t1_pool |= c
+                # list every short name shortscan found (restores the per-name
+                # visibility the single-pass version printed)
+                log(f"{yellow(sn.label())} -> {len(c)} tier-1 candidate(s)"
+                    + (f"  {dim('(shortscan: ' + sn.fullname + ')')}"
+                       if sn.fullname else ""),
                     depth)
+            if t1_pool:
+                hits = fire(url, sorted(t1_pool), depth)
+                files, dirs = classify(hits, url)
+                emit(files, dirs, depth, url)
+                confirmed_now |= set(files) | set(dirs)
+                fired |= {x.rstrip("/").lower() for x in t1_pool}
 
-        if not all_candidates:
-            return
+            unresolved = unconfirmed_shortnames(
+                [(sn, sn_cands[sn]) for sn in pending], confirmed_now)
+            log(dim(f"tier 1: {len(t1_pool)} candidate(s) -> "
+                    f"{len(pending) - len(unresolved)}/{len(pending)} short "
+                    f"name(s) resolved"), depth)
 
-        hits = run_ffuf(url, sorted(all_candidates), args, depth)
-        files, dirs = classify(hits, url)
-        emit(files, dirs, depth, url)
+            # ----- tier 2: the expensive fan-out, ONLY for the leftovers ----- #
+            if unresolved:
+                t2_pool = set()
+                for sn in unresolved:
+                    c = build_candidates_tier2(sn, stems, suffixes, exts, args)
+                    c = {x for x in c if x.rstrip("/").lower() not in fired}
+                    sn_cands[sn] |= candset(c)
+                    t2_pool |= c
+                    log(f"{yellow(sn.label())} -> {len(c)} tier-2 candidate(s)",
+                        depth)
+                if t2_pool:
+                    hits = fire(url, sorted(t2_pool), depth)
+                    files, dirs = classify(hits, url)
+                    emit(files, dirs, depth, url)
+                    confirmed_now |= set(files) | set(dirs)
 
-        # short names that produced no confirmed hit (seeded dirs are trusted,
-        # so they're exempt). Collected for the end-of-run last-chance pass.
-        if sn_candsets:
-            for sn in unconfirmed_shortnames(sn_candsets, set(files) | set(dirs)):
+            # short names still unresolved after both tiers -> last-chance bucket
+            for sn in unconfirmed_shortnames(
+                    [(sn, sn_cands[sn]) for sn in pending], confirmed_now):
                 unconfirmed.append((url, depth, sn))
                 log(f"{red('UNRESOLVED')} {yellow(sn.label())} "
                     f"{dim('(exists, full name not recovered)')}", depth)
@@ -1170,8 +1522,34 @@ def main():
             banner(f"depth {depth}  {url}", depth)
             scan_directory(url, depth)
 
+    # ---- insertion-point mode: manual targeted fuzz, no shortscan ---------- #
+    # When set, skip shortscan/candidate generation on the start directory and
+    # fuzz a single operator-specified insertion point instead. Any directory the
+    # fuzz turns up is still shortscanned normally by drain() (honouring
+    # --max-depth), and the custom/last-chance phases below are naturally skipped
+    # because they only fire on shortscan's unconfirmed short names (none here).
+    if args.insertion_point:
+        if FUZZ_KEYWORD not in args.insertion_point:
+            sys.exit(red(f"--insertion-point must contain the keyword "
+                         f"'{FUZZ_KEYWORD}', e.g. 'requireFUZZ.zip'"))
+        queue.clear()                    # don't shortscan the start dir itself
+        words = []
+        for pth in args.insertion_wordlist:
+            words += _read_lines(pth)
+        cands = build_insertion_candidates(args.insertion_point, words)
+        banner(f"insertion point  {start}{args.insertion_point}  "
+               f"({len(cands)} candidate(s) from {len(words)} word(s))")
+        if not cands:
+            log(red("no candidates generated (empty wordlist?)"))
+        else:
+            hits = fire(start, cands, 0)
+            files, dirs = classify(hits, start)
+            emit(files, dirs, 0, start)
+        drain()                          # recurse into any directory it found
+
     # ---- phase 1: normal (curated) recursive scan -------------------------- #
-    drain()
+    if not args.insertion_point:
+        drain()
 
     # ---- phase 2: custom full-name pass on unresolved short names ---------- #
     # A cheap, targeted shot before the loud retry: a curated list of real
@@ -1203,7 +1581,7 @@ def main():
             banner(f"custom-list  {u}", d)
             log(f"{yellow('custom')} {len(sns)} unresolved short name(s) -> "
                 f"{len(retry_cands)} curated name(s)", d)
-            hits = run_ffuf(u, sorted(retry_cands), args, d)
+            hits = fire(u, sorted(retry_cands), d)
             files, dirs = classify(hits, u)
             emit(files, dirs, d, u)
             for sn in unconfirmed_shortnames(retry_sets, set(files) | set(dirs)):
@@ -1241,7 +1619,7 @@ def main():
                 banner(f"last-chance  {u}", d)
                 log(f"{yellow('retry')} {len(sns)} unresolved short name(s) -> "
                     f"{len(retry_cands)} candidates", d)
-                hits = run_ffuf(u, sorted(retry_cands), args, d)
+                hits = fire(u, sorted(retry_cands), d)
                 files, dirs = classify(hits, u)
                 emit(files, dirs, d, u)
                 for sn in unconfirmed_shortnames(retry_sets, set(files) | set(dirs)):
@@ -1253,6 +1631,7 @@ def main():
     # ---- summary ----------------------------------------------------------- #
     print()
     banner(f"done - {len(confirmed_urls)} confirmed URL(s)")
+    log(dim(f"{requests_fired[0]} candidate request(s) fired"))
     if args.output:
         log(f"written to {args.output}")
     elif confirmed_urls:
@@ -1279,6 +1658,29 @@ def main():
                 for u, label in rows:
                     fh.write(f"{u}\t{label}\n")
             log(f"unconfirmed written to {unc_path}")
+
+    if unservable:
+        # confirmed to exist (shortscan) but the extension is server-blocked, so
+        # ffuf can't fetch or recover the full name -- a separate, higher-confidence
+        # category than the generic "unconfirmed" above. dedupe (url, label).
+        seen, rows = set(), []
+        for u, _d, sn, ext, hints in unservable:
+            key = (u, sn.label())
+            if key not in seen:
+                seen.add(key)
+                rows.append((u, sn.label(), ext, hints))
+        print()
+        banner(f"{len(rows)} unservable - exist (shortscan) but the extension is "
+               f"server-blocked; name not fetchable over HTTP")
+        for u, label, ext, hints in rows:
+            tail = f"  {dim('~ ' + ', '.join(hints))}" if hints else ""
+            print(f"  {u}  [{label}]  .{ext} blocked{tail}")
+        if args.output:
+            uns_path = args.output + ".unservable"
+            with open(uns_path, "w") as fh:
+                for u, label, ext, hints in rows:
+                    fh.write(f"{u}\t{label}\t{ext}\t{','.join(hints)}\n")
+            log(f"unservable written to {uns_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1326,15 +1728,43 @@ def parse_args():
                         "the loud retry; merged with the built-in CUSTOM_NAMES")
     g.add_argument("--no-custom", action="store_true",
                    help="skip the custom full-name pass before the loud retry")
+    g.add_argument("--no-unservable-check", action="store_true",
+                   help="don't probe for server-blocked extensions (.config, "
+                        ".cs, .master, ...). Without this flag, short names whose "
+                        "extension IIS/ASP.NET refuses to serve are detected with "
+                        "one control request each and reported separately as "
+                        "'unservable' (they exist per shortscan but can't be "
+                        "fetched), instead of being fuzzed and loud-retried in "
+                        "vain")
     g.add_argument("--compound-stems", action="store_true",
                    help="also append the curated common-suffix words to the "
                         "dictionary stem matches (not just the bare 6-char "
                         "prefix), reaching compounds like contract+management "
                         "or export+data; higher volume, off by default")
+    g.add_argument("--compound-joiners", nargs="+", metavar="JOINER",
+                   default=list(COMPOUND_JOINERS),
+                   help="joiner(s) placed between a dictionary stem match and a "
+                        "curated suffix word under --compound-stems (contract + "
+                        "management -> contractmanagement / contract_management / "
+                        "contract-management). Default: '' '_' '-'. Pass the "
+                        "token 'empty' for direct concatenation and 'space' for "
+                        "%%20 (a real spaced name like 'contract management' "
+                        "collapses to the same 8.3 short name and is reachable "
+                        "only as 'contract%%20management'), e.g. "
+                        "--compound-joiners empty _ space. Only applies with "
+                        "--compound-stems")
     g.add_argument("--resolve-assets", action="store_true",
                    help="also try to recover CSS/image full names; by default "
                         "short names with a css/png/jpg/gif/ico/svg/... "
                         "extension are skipped as low-value static assets")
+    g.add_argument("--probe-dirs", action="store_true",
+                   help="for an extension-less short name, also fire the explicit "
+                        "'name/' directory probe. Off by default: a real "
+                        "directory 301-redirects name -> name/ (which classify() "
+                        "keys on), so the slash probe is usually redundant and "
+                        "doubles the request count for the commonest short-name "
+                        "shape. Enable it for a server where 'name' 404s but "
+                        "'name/' answers")
     g.add_argument("--suffix-wordlists", nargs="+", default=[
         f"{SECLISTS}/raft-small-words-lowercase.txt",
     ], help="full word list appended after the 6-char prefix when --loud is set "
@@ -1350,6 +1780,22 @@ def parse_args():
     g.add_argument("--ext-wordlists", nargs="+", default=[
         f"{SECLISTS}/raft-medium-extensions-lowercase.txt",
     ], help="lists of extensions (leading dot optional)")
+
+    g = p.add_argument_group("insertion point (manual targeted fuzzing)")
+    g.add_argument("--insertion-point", metavar="TEMPLATE",
+                   help="manual fuzz mode: skip shortscan and the candidate "
+                        "generator entirely and fire a wordlist at a single "
+                        "insertion point under the base URL, where the literal "
+                        "keyword FUZZ marks the spot (e.g. 'requireFUZZ.zip', "
+                        "'backupFUZZ', 'FUZZ.bak'). Each --insertion-wordlist "
+                        "entry is substituted for FUZZ and the result is "
+                        "confirmed / file-vs-dir classified / recorded / recursed "
+                        "exactly like any other hit. Use --max-depth 0 for a "
+                        "one-shot with no recursion into discovered directories")
+    g.add_argument("--insertion-wordlist", nargs="+", metavar="FILE", default=[
+        f"{SECLISTS}/raft-small-words-lowercase.txt",
+    ], help="wordlist(s) substituted into the --insertion-point FUZZ keyword "
+            "(default raft-small-words); only used in insertion-point mode")
 
     g = p.add_argument_group("claude (optional LLM reasoning via the claude CLI)")
     g.add_argument("--claude", action="store_true",
@@ -1379,12 +1825,15 @@ def parse_args():
                    help="append 0..N (and zero-padded 2-digit forms) to prefixes")
     g.add_argument("--year-start", type=int, default=2015)
     g.add_argument("--year-end", type=int, default=2026)
-    g.add_argument("--number-matches", action="store_true", default=True,
-                   help="also append a light number set to wordlist matches, "
-                        "not just the bare prefix")
+    g.add_argument("--number-matches", action="store_true", default=False,
+                   help="also append a light number set to every dictionary "
+                        "match, not just the bare prefix. Off by default: it "
+                        "multiplies by the match count and is a large, low-hit "
+                        "volume driver (a prefix with 50 matches adds ~1100 "
+                        "candidates)")
     g.add_argument("--no-number-matches", dest="number_matches",
                    action="store_false",
-                   help="only put numbers on the bare prefix (lower volume)")
+                   help="(default) only put numbers on the bare prefix")
 
     g = p.add_argument_group("http")
     g.add_argument("-H", "--header", action="append", default=[],
@@ -1404,7 +1853,9 @@ def parse_args():
     g.add_argument("--shortscan-bin", default="shortscan")
     g.add_argument("--ffuf-bin", default="ffuf")
 
-    return p.parse_args()
+    args = p.parse_args()
+    args.compound_joiners = normalize_joiners(args.compound_joiners)
+    return args
 
 
 if __name__ == "__main__":
